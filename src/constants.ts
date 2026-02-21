@@ -1,0 +1,3 @@
+export const IS_PUBLIC_KEY = 'isPublic';
+export const AUTH_USER_REPOSITORY = 'AUTH_USER_REPOSITORY';
+export const AUTH_EVENT_EMITTER = 'AUTH_EVENT_EMITTER';
