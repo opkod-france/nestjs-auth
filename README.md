@@ -18,6 +18,7 @@ NestJS authentication module with JWT access/refresh tokens, bcryptjs password h
 - [Token refresh flow](#token-refresh-flow)
 - [Events](#events)
 - [Custom HashService](#custom-hashservice)
+- [Examples](#examples)
 - [API reference](#api-reference)
 - [License](#license)
 
@@ -306,6 +307,269 @@ export class Argon2HashService extends HashService {
 // In your module:
 { provide: HashService, useClass: Argon2HashService }
 ```
+
+## Examples
+
+### SaaS API with global guard
+
+Protect every route by default and selectively mark public endpoints. Combine with `@opkod-france/nestjs-rbac` for permission-based access control.
+
+```ts
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
+import { AuthModule, JwtAuthGuard, AUTH_USER_REPOSITORY } from '@opkod-france/nestjs-auth';
+import { UserRepository } from './user.repository';
+
+@Module({
+  imports: [
+    AuthModule.forRoot({
+      jwt: {
+        secret: process.env.JWT_SECRET,
+        accessExpiresIn: '15m',
+        refreshExpiresIn: '7d',
+      },
+    }),
+  ],
+  providers: [
+    { provide: AUTH_USER_REPOSITORY, useClass: UserRepository },
+    { provide: APP_GUARD, useClass: JwtAuthGuard }, // every route protected
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+// products.controller.ts — mix of public and protected routes
+@Controller('products')
+export class ProductsController {
+  constructor(private readonly productsService: ProductsService) {}
+
+  @Public()  // anyone can browse
+  @Get()
+  findAll() {
+    return this.productsService.findAll();
+  }
+
+  @Public()
+  @Get(':id')
+  findOne(@Param('id') id: string) {
+    return this.productsService.findOne(id);
+  }
+
+  @Post()  // authenticated users only
+  create(@CurrentUser('sub') userId: string, @Body() dto: CreateProductDto) {
+    return this.productsService.create(userId, dto);
+  }
+
+  @Delete(':id')
+  remove(@CurrentUser('sub') userId: string, @Param('id') id: string) {
+    return this.productsService.remove(userId, id);
+  }
+}
+```
+
+---
+
+### Multi-tenant app with Prisma
+
+A repository implementation using Prisma, scoped to a tenant database.
+
+```ts
+// user.repository.ts
+import { Injectable } from '@nestjs/common';
+import { AuthUserRepository, AuthUserRecord } from '@opkod-france/nestjs-auth';
+import { PrismaService } from '../prisma/prisma.service';
+
+@Injectable()
+export class PrismaUserRepository extends AuthUserRepository {
+  constructor(private readonly prisma: PrismaService) {
+    super();
+  }
+
+  async findByEmail(email: string): Promise<AuthUserRecord | null> {
+    const user = await this.prisma.user.findUnique({ where: { email } });
+    if (!user) return null;
+    return {
+      id: user.id,
+      email: user.email,
+      passwordHash: user.passwordHash,
+      refreshTokenHash: user.refreshTokenHash,
+    };
+  }
+
+  async findById(id: string): Promise<AuthUserRecord | null> {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user) return null;
+    return {
+      id: user.id,
+      email: user.email,
+      passwordHash: user.passwordHash,
+      refreshTokenHash: user.refreshTokenHash,
+    };
+  }
+
+  async updateRefreshTokenHash(userId: string, hash: string | null): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { refreshTokenHash: hash },
+    });
+  }
+}
+```
+
+---
+
+### Security audit logging
+
+Use event emission to track login attempts and build a security audit trail.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as AuthService
+    participant E as EventEmitter2
+    participant L as AuditLogger
+    participant DB as Audit DB
+
+    C->>A: login(email, password)
+    alt success
+        A->>E: emit('auth.login', LoginEvent)
+        E->>L: handleLogin(event)
+        L->>DB: insert audit log (success)
+    else failure
+        A->>E: emit('auth.login.failed', LoginFailedEvent)
+        E->>L: handleLoginFailed(event)
+        L->>DB: insert audit log (failure)
+        L->>L: check brute-force threshold
+    end
+```
+
+```ts
+// audit.module.ts
+import { Module } from '@nestjs/common';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { AuditListener } from './audit.listener';
+
+@Module({
+  imports: [EventEmitterModule.forRoot()],
+  providers: [AuditListener],
+})
+export class AuditModule {}
+```
+
+```ts
+// audit.listener.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+import {
+  LoginEvent,
+  LoginFailedEvent,
+  LogoutEvent,
+} from '@opkod-france/nestjs-auth';
+
+@Injectable()
+export class AuditListener {
+  private readonly logger = new Logger(AuditListener.name);
+  private readonly failedAttempts = new Map<string, number>();
+
+  @OnEvent('auth.login')
+  async handleLogin(event: LoginEvent) {
+    this.failedAttempts.delete(event.email);
+    this.logger.log(`Login success: ${event.email} (user: ${event.userId})`);
+    await this.saveAuditLog('login_success', event.email, event.userId);
+  }
+
+  @OnEvent('auth.login.failed')
+  async handleLoginFailed(event: LoginFailedEvent) {
+    const attempts = (this.failedAttempts.get(event.email) ?? 0) + 1;
+    this.failedAttempts.set(event.email, attempts);
+
+    this.logger.warn(
+      `Login failed: ${event.email} — ${event.reason} (attempt #${attempts})`,
+    );
+    await this.saveAuditLog('login_failed', event.email, undefined, event.reason);
+
+    if (attempts >= 5) {
+      this.logger.error(`Brute-force threshold reached for ${event.email}`);
+      // notify admin, lock account, trigger CAPTCHA, etc.
+    }
+  }
+
+  @OnEvent('auth.logout')
+  async handleLogout(event: LogoutEvent) {
+    this.logger.log(`Logout: user ${event.userId}`);
+    await this.saveAuditLog('logout', undefined, event.userId);
+  }
+
+  private async saveAuditLog(
+    action: string,
+    email?: string,
+    userId?: string,
+    reason?: string,
+  ) {
+    // persist to your audit table / external logging service
+  }
+}
+```
+
+---
+
+### Combining with `@opkod-france/nestjs-rbac`
+
+Use both packages together for authentication + authorization. `nestjs-auth` handles identity (who are you?), `nestjs-rbac` handles access (what can you do?).
+
+```mermaid
+flowchart LR
+    Request --> JwtAuthGuard
+    JwtAuthGuard -->|set request.user| PermissionsGuard
+    PermissionsGuard -->|check permissions| Handler["Route Handler"]
+
+    JwtAuthGuard -->|401| Reject1["Unauthorized"]
+    PermissionsGuard -->|403| Reject2["Forbidden"]
+```
+
+```ts
+// app.module.ts
+import { APP_GUARD } from '@nestjs/core';
+import { AuthModule, JwtAuthGuard } from '@opkod-france/nestjs-auth';
+import { RbacModule, PermissionsGuard } from '@opkod-france/nestjs-rbac';
+
+@Module({
+  imports: [
+    AuthModule.forRoot({ jwt: { secret: process.env.JWT_SECRET } }),
+    RbacModule.forRoot({ repository: new MyRbacRepository() }),
+  ],
+  providers: [
+    { provide: APP_GUARD, useClass: JwtAuthGuard },       // 1st: authenticate
+    { provide: APP_GUARD, useClass: PermissionsGuard },    // 2nd: authorize
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+// articles.controller.ts
+import { Public } from '@opkod-france/nestjs-auth';
+import { RequirePermissions } from '@opkod-france/nestjs-rbac';
+
+@Controller('articles')
+export class ArticlesController {
+  @Public()  // skip both guards
+  @Get()
+  findAll() {}
+
+  @RequirePermissions('article:write')  // must be authenticated + have permission
+  @Post()
+  create(@CurrentUser('sub') userId: string, @Body() dto: CreateArticleDto) {}
+
+  @RequirePermissions('article:delete')
+  @Delete(':id')
+  remove(@Param('id') id: string) {}
+}
+```
+
+`JwtAuthGuard` sets `request.user.sub`, which `PermissionsGuard` reads by default — zero config needed.
 
 ## API reference
 
